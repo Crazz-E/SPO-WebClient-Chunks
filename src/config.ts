@@ -3,7 +3,7 @@
  */
 
 export interface CliConfig {
-  /** Maps to generate (empty = all maps in cache) */
+  /** Maps to process (empty = all maps in cache) */
   maps: string[];
 
   /** Path to cache/ directory (synced assets) */
@@ -14,6 +14,9 @@ export interface CliConfig {
 
   /** Skip asset sync from update server */
   skipSync: boolean;
+
+  /** Skip texture extraction and chunk generation (upload only) */
+  skipGenerate: boolean;
 
   /** Skip upload to R2 */
   skipUpload: boolean;
@@ -39,6 +42,7 @@ export function createDefaultConfig(): CliConfig {
     cacheDir: './cache',
     outputDir: './webclient-cache',
     skipSync: false,
+    skipGenerate: false,
     skipUpload: false,
     workers: 0,
     dryRun: false,

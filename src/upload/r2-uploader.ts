@@ -1,5 +1,11 @@
 /**
- * R2 Uploader — uploads generated chunks to Cloudflare R2 (S3-compatible).
+ * R2 Uploader — uploads all static assets to Cloudflare R2 (S3-compatible).
+ *
+ * Uploads:
+ * - chunks/     → terrain chunk WebP images + preview PNGs (filtered by map)
+ * - textures/   → terrain atlases (PNG + JSON) + individual textures
+ * - objects/    → road/concrete/car atlases (PNG + JSON)
+ * - cache/      → baked object textures (PNG/GIF)
  *
  * Handles parallel uploads with concurrency control, idempotency (skip existing),
  * and retry with exponential backoff.
@@ -49,12 +55,97 @@ export class R2Uploader {
   }
 
   /**
-   * Upload all chunk files from outputDir to R2.
-   * Structure: chunks/{mapName}/{terrainType}/{season}/z{zoom}/chunk_{i}_{j}.webp
+   * Upload all static assets from the output directory to R2.
+   *
+   * @param outputDir  Root output directory (webclient-cache/)
+   * @param mapFilter  Optional set of map names (lowercase) to filter chunks.
+   *                   When provided, only chunks for those maps are uploaded.
+   *                   Textures, objects, and cache are always uploaded (shared).
    */
-  async uploadChunks(chunksDir: string): Promise<UploadResult> {
-    const jobs = this.collectJobs(chunksDir, 'chunks');
+  async uploadAll(outputDir: string, mapFilter?: Set<string> | null): Promise<UploadResult> {
+    const jobs: UploadJob[] = [];
+
+    // 1. Chunks (filtered by map)
+    const chunksDir = path.join(outputDir, 'chunks');
+    if (fs.existsSync(chunksDir)) {
+      if (mapFilter && mapFilter.size > 0) {
+        for (const entry of fs.readdirSync(chunksDir, { withFileTypes: true })) {
+          if (entry.isDirectory() && mapFilter.has(entry.name.toLowerCase())) {
+            const mapDir = path.join(chunksDir, entry.name);
+            jobs.push(...this.collectJobs(mapDir, `chunks/${entry.name}`));
+          }
+        }
+      } else {
+        jobs.push(...this.collectJobs(chunksDir, 'chunks'));
+      }
+    }
+
+    // 2. Textures (always — shared across maps)
+    const texturesDir = path.join(outputDir, 'textures');
+    if (fs.existsSync(texturesDir)) {
+      jobs.push(...this.collectJobs(texturesDir, 'textures'));
+    }
+
+    // 3. Objects (always — shared)
+    const objectsDir = path.join(outputDir, 'objects');
+    if (fs.existsSync(objectsDir)) {
+      jobs.push(...this.collectJobs(objectsDir, 'objects'));
+    }
+
+    // 4. Cache (always — shared)
+    const cacheDir = path.join(outputDir, 'cache');
+    if (fs.existsSync(cacheDir)) {
+      jobs.push(...this.collectJobs(cacheDir, 'cache'));
+    }
+
+    if (jobs.length === 0) {
+      return { uploaded: 0, skipped: 0, failed: 0, totalBytes: 0 };
+    }
+
     return this.executeJobs(jobs);
+  }
+
+  /**
+   * Count uploadable files (for progress bar setup).
+   */
+  countUploadableFiles(outputDir: string, mapFilter?: Set<string> | null): number {
+    let count = 0;
+
+    // Chunks (filtered)
+    const chunksDir = path.join(outputDir, 'chunks');
+    if (fs.existsSync(chunksDir)) {
+      if (mapFilter && mapFilter.size > 0) {
+        for (const entry of fs.readdirSync(chunksDir, { withFileTypes: true })) {
+          if (entry.isDirectory() && mapFilter.has(entry.name.toLowerCase())) {
+            count += this.countFilesRecursive(path.join(chunksDir, entry.name));
+          }
+        }
+      } else {
+        count += this.countFilesRecursive(chunksDir);
+      }
+    }
+
+    // Shared dirs (always counted)
+    for (const dir of ['textures', 'objects', 'cache']) {
+      const fullPath = path.join(outputDir, dir);
+      if (fs.existsSync(fullPath)) {
+        count += this.countFilesRecursive(fullPath);
+      }
+    }
+
+    return count;
+  }
+
+  private countFilesRecursive(dir: string): number {
+    let count = 0;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) count += this.countFilesRecursive(path.join(dir, entry.name));
+      else if (entry.isFile()) {
+        if (entry.name === 'index.json' || entry.name.endsWith('.bmp')) continue;
+        count++;
+      }
+    }
+    return count;
   }
 
   /**
@@ -65,12 +156,15 @@ export class R2Uploader {
     if (!fs.existsSync(localDir)) return jobs;
 
     const walk = (dir: string): void => {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) {
           walk(fullPath);
         } else if (entry.isFile()) {
+          // Skip internal metadata and BMP originals
+          if (entry.name === 'index.json') continue;
+          if (entry.name.endsWith('.bmp')) continue;
+
           const relativePath = path.relative(localDir, fullPath).replace(/\\/g, '/');
           const key = `${keyPrefix}/${relativePath}`;
 
@@ -78,6 +172,7 @@ export class R2Uploader {
           if (entry.name.endsWith('.webp')) contentType = 'image/webp';
           else if (entry.name.endsWith('.json')) contentType = 'application/json';
           else if (entry.name.endsWith('.png')) contentType = 'image/png';
+          else if (entry.name.endsWith('.gif')) contentType = 'image/gif';
 
           jobs.push({ localPath: fullPath, key, contentType });
         }
@@ -95,7 +190,6 @@ export class R2Uploader {
     const result: UploadResult = { uploaded: 0, skipped: 0, failed: 0, totalBytes: 0 };
     let completed = 0;
 
-    const semaphore = { running: 0 };
     const queue = [...jobs];
 
     const processJob = async (job: UploadJob): Promise<void> => {
