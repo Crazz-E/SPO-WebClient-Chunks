@@ -1,37 +1,53 @@
 # SPO-WebClient-Chunks
 
-Standalone terrain chunk generator for **Starpeace Online**. Generates isometric map chunks from game assets and uploads them to Cloudflare R2 CDN.
+Standalone asset pipeline for **Starpeace Online**. Syncs game assets, generates isometric terrain chunks, texture atlases, and object sprites, then uploads everything to Cloudflare R2 CDN.
 
 ## Architecture
 
 ```
-SPO-WebClient-Chunks (this tool)               SPO-WebClient (game client)
-┌─────────────────────────────┐                ┌──────────────────────────┐
-│ 1. Sync assets from server  │                │                          │
-│ 2. Extract textures + atlas │  ──uploads──>  │ Client fetches chunks    │
-│ 3. Generate terrain chunks  │  Cloudflare R2 │ from CDN URL instead of  │
-│ 4. Upload to R2 CDN         │                │ local server             │
-└─────────────────────────────┘                └──────────────────────────┘
+SPO-WebClient-Chunks (this tool, runs on Linux/WSL)
+┌──────────────────────────────────────┐
+│ 1. Sync assets from update server    │
+│ 2. Extract textures + build atlases  │     Cloudflare R2
+│ 3. Bake object textures (alpha)      │ ──── uploads ────> spo.zz.works (CDN)
+│ 4. Generate terrain chunks (WebP)    │
+│ 5. Generate terrain previews         │
+│ 6. Upload all static assets to R2    │
+└──────────────────────────────────────┘
+
+SPO-WebClient (game client)
+┌──────────────────────────────────────┐
+│ Fetches all static assets from CDN   │ <── https://spo.zz.works/...
+│ No local generation needed           │
+└──────────────────────────────────────┘
 ```
 
-**Designed for Linux** — uses Sharp (native image processing, 5-10x faster than WASM).
+**Designed for Linux** — uses Sharp (native image processing, 5-10x faster than WASM on Linux).
 
 ## Quick Start
 
 ```bash
-# Clone and install (in WSL or Linux)
+# Clone and install (in WSL or native Linux)
 git clone https://github.com/Crazz-E/SPO-WebClient-Chunks.git
 cd SPO-WebClient-Chunks
 npm install
 npm run build
 
-# Generate chunks for one map (no upload)
-node dist/cli.js --map Shamba --skip-upload \
-  --cache-dir /path/to/SPO-WebClient/cache
-
-# Generate all maps and upload to R2
+# Full pipeline: sync + generate + upload (Shamba & Zorcon maps)
 node dist/cli.js \
-  --cache-dir /path/to/SPO-WebClient/cache \
+  --map Shamba Zorcon \
+  --r2-access-key YOUR_KEY \
+  --r2-secret-key YOUR_SECRET \
+  --r2-endpoint https://ACCOUNT_ID.r2.cloudflarestorage.com \
+  --r2-bucket spo-chunks
+
+# Generate only, no upload
+node dist/cli.js --map Shamba --skip-upload
+
+# Upload only (assets already generated)
+node dist/cli.js \
+  --map Shamba Zorcon \
+  --skip-generate \
   --r2-access-key YOUR_KEY \
   --r2-secret-key YOUR_SECRET \
   --r2-endpoint https://ACCOUNT_ID.r2.cloudflarestorage.com \
@@ -42,12 +58,13 @@ node dist/cli.js \
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--map <name...>` | Maps to generate (repeatable) | All maps |
-| `--cache-dir <path>` | Path to cache/ directory | `./cache` |
-| `--output-dir <path>` | Output directory | `./webclient-cache` |
+| `--map <name...>` | Maps to process (space-separated) | All maps in cache |
+| `--cache-dir <path>` | Path to cache/ directory (synced assets) | `./cache` |
+| `--output-dir <path>` | Output directory for generated assets | `./webclient-cache` |
 | `--skip-sync` | Skip asset sync from update server | false |
+| `--skip-generate` | Skip generation, upload only | false |
 | `--skip-upload` | Generate only, no R2 upload | false |
-| `--workers <n>` | Worker threads (0 = auto) | 0 |
+| `--workers <n>` | Worker threads (0 = auto) | 0 (auto) |
 | `--dry-run` | Preview without executing | false |
 | `--r2-access-key` | R2 access key ID | `$R2_ACCESS_KEY_ID` |
 | `--r2-secret-key` | R2 secret access key | `$R2_SECRET_ACCESS_KEY` |
@@ -56,70 +73,94 @@ node dist/cli.js \
 
 ## Pipeline
 
-1. **Sync** — Downloads game assets from `update.starpeaceonline.com` (CAB archives)
-2. **Extract** — Extracts textures from CABs, bakes alpha transparency, builds 1024x1536 atlases
-3. **Generate** — Renders 32x32-tile isometric chunks at 4 zoom levels (Z0-Z3) using worker pool
-4. **Upload** — Pushes WebP chunks to Cloudflare R2 with 1-year cache headers
+| Step | Description | Skippable |
+|------|-------------|-----------|
+| **1. Sync** | Downloads game assets from `update.starpeaceonline.com` (CAB archives) | `--skip-sync` |
+| **2. Extract** | Extracts textures from CABs, bakes alpha transparency, builds terrain + object atlases | `--skip-generate` |
+| **3. Copy** | Copies baked object textures (roads, concrete, cars) to output directory | `--skip-generate` |
+| **4. Generate** | Renders 32×32-tile isometric chunks at 4 zoom levels using worker thread pool | `--skip-generate` |
+| **5. Preview** | Composites all Z0 chunks into low-res map backdrop PNGs | `--skip-generate` |
+| **6. Upload** | Pushes all assets to Cloudflare R2 with 1-year immutable cache headers | `--skip-upload` |
 
-### Output Structure
+### R2 Key Structure (CDN paths)
 
 ```
-webclient-cache/chunks/
-  {mapName}/
-    {terrainType}/
-      {season}/          (0=Winter, 1=Spring, 2=Summer, 3=Autumn)
-        z0/chunk_{i}_{j}.webp   (260×130px)
-        z1/chunk_{i}_{j}.webp   (520×260px)
-        z2/chunk_{i}_{j}.webp   (1040×520px)
-        z3/chunk_{i}_{j}.webp   (2080×1040px)
-        manifest.json
+spo-chunks/                                  (R2 bucket → spo.zz.works)
+├── chunks/
+│   └── {map}/{terrain}/{season}/
+│       ├── z0/chunk_{i}_{j}.webp            Zoom level 0 (260×132px)
+│       ├── z1/chunk_{i}_{j}.webp            Zoom level 1 (520×264px)
+│       ├── z2/chunk_{i}_{j}.webp            Zoom level 2 (1040×528px)
+│       ├── z3/chunk_{i}_{j}.webp            Zoom level 3 (2080×1056px)
+│       └── preview.png                      Low-res map backdrop
+├── textures/
+│   └── {terrain}/{season}/
+│       ├── atlas.png                        Terrain sprite sheet (1024×1536)
+│       ├── atlas.json                       Atlas manifest (tile → rect)
+│       └── {paletteIndex}.png               Individual textures (fallback)
+├── objects/
+│   ├── road-atlas.png                       Road sprite sheet
+│   ├── road-atlas.json                      Road atlas manifest
+│   ├── concrete-atlas.png                   Concrete sprite sheet
+│   ├── concrete-atlas.json                  Concrete atlas manifest
+│   ├── car-atlas.png                        Car sprite sheet
+│   └── car-atlas.json                       Car atlas manifest
+└── cache/
+    ├── RoadBlockImages/{name}.png           Baked road textures
+    ├── ConcreteImages/{name}.png            Baked concrete textures
+    └── CarImages/{name}.png                 Baked car textures
 ```
 
-## Cloudflare R2 + DNS Setup
+## Cloudflare R2 + CDN Setup
 
-### 1. Create R2 Bucket
+### 1. Move DNS to Cloudflare
 
-1. Cloudflare Dashboard → R2 Object Storage → **Create bucket**
-2. Name: `spo-chunks`
-3. Location: Auto
+R2 custom domains **require** Cloudflare-managed DNS.
 
-### 2. Create API Token
+1. Cloudflare Dashboard → **Add a site** → enter your domain → select **Free** plan
+2. Update nameservers at your registrar to Cloudflare's assigned pair
+3. Re-create existing DNS records in Cloudflare (A, CNAME, MX, etc.)
+4. Set non-proxied records to **DNS only** (gray cloud)
 
-1. R2 → **Manage R2 API Tokens** → Create API token
-2. Permissions: **Object Read & Write**
-3. Scope: `spo-chunks` bucket only
-4. Save the Access Key ID and Secret Access Key
+### 2. Create R2 Bucket
 
-### 3. Custom Domain (spo.zz.works)
+1. Cloudflare Dashboard → **R2 Object Storage** → **Create bucket**
+2. Bucket name: `spo-chunks`
+3. Location: Automatic
 
-#### Option A: Add zz.works to Cloudflare DNS (Recommended)
+### 3. Connect Custom Domain
 
-This gives you `spo.zz.works` with automatic SSL and edge caching:
+1. R2 → `spo-chunks` → **Settings** → **Custom Domains** → **Connect Domain**
+2. Enter: `spo.zz.works`
+3. Cloudflare auto-creates CNAME + SSL certificate
+4. Wait for status: **Active**
 
-1. **Add `zz.works` as a site** in Cloudflare Dashboard (Free plan)
-2. **Update nameservers** at your registrar to Cloudflare's assigned nameservers
-3. **Re-create existing DNS records** (A, CNAME, MX, etc.) in Cloudflare
-4. **R2 custom domain**: R2 → `spo-chunks` → Settings → Custom Domains → Add `spo.zz.works`
-5. Cloudflare auto-creates the CNAME and SSL certificate
+### 4. Create R2 API Token
 
-> Your existing site's DNS records will work identically — you're just changing who manages the nameservers. Set non-SPO records to "DNS only" (gray cloud) if you don't want Cloudflare proxying them.
+1. R2 Overview → **Manage R2 API Tokens** → **Create Account API token**
+2. Token name: `spo-chunks-upload`
+3. Permissions: **Object Read & Write**
+4. Bucket scope: **Apply to specific buckets only** → `spo-chunks`
+5. Save the **Access Key ID** and **Secret Access Key**
 
-#### Option B: Use R2 Public URL Directly
+### 5. Add Cache Rule
 
-If you can't move DNS:
+R2 custom domains need an explicit cache rule for edge caching:
 
-1. R2 → `spo-chunks` → Settings → **Public access** → Enable
-2. Use the provided URL: `https://pub-{hash}.r2.dev`
-3. Set `CHUNK_CDN_URL=https://pub-{hash}.r2.dev` in SPO-WebClient
+1. Cloudflare Dashboard → select `zz.works` → **Caching** → **Cache Rules**
+2. **Create rule**: name `Cache R2 assets`
+3. **When**: Hostname equals `spo.zz.works`
+4. **Then**: Eligible for cache, Edge TTL override = 1 year
+5. **Deploy**
 
-### 4. CORS Configuration
+### 6. CORS Configuration
 
-R2 → `spo-chunks` → Settings → CORS:
+R2 → `spo-chunks` → **Settings** → **CORS Policy**:
 
 ```json
 [
   {
-    "AllowedOrigins": ["https://your-webclient-domain.com", "http://localhost:8080"],
+    "AllowedOrigins": ["https://your-domain.com", "http://localhost:8080"],
     "AllowedMethods": ["GET", "HEAD"],
     "AllowedHeaders": ["*"],
     "MaxAgeSeconds": 86400
@@ -127,15 +168,11 @@ R2 → `spo-chunks` → Settings → CORS:
 ]
 ```
 
-### 5. SPO-WebClient Configuration
-
-Set the environment variable before starting the game server:
+### 7. SPO-WebClient Configuration
 
 ```bash
-CHUNK_CDN_URL=https://spo.zz.works node dist/server/server.js
+CHUNK_CDN_URL=https://spo.zz.works npm run dev
 ```
-
-The client automatically fetches chunks from the CDN URL when configured.
 
 ## Development
 
@@ -149,26 +186,26 @@ npm start        # Run CLI (after build)
 
 ```
 src/
-├── cli.ts                 # Entry point + orchestration
-├── config.ts              # CLI config resolution
-├── progress.ts            # Animated progress bars
+├── cli.ts                    Entry point + pipeline orchestration
+├── config.ts                 CLI config resolution
+├── progress.ts               Animated multi-bar progress (chalk + cli-progress)
 ├── pipeline/
-│   ├── sync-service.ts    # Asset sync from update server
-│   ├── texture-extractor.ts  # CAB → texture → atlas
-│   ├── map-data-service.ts   # Map INI/BMP loading
-│   ├── chunk-renderer.ts     # RGBA chunk generation + worker pool
-│   └── chunk-worker.ts       # Worker thread kernel
+│   ├── sync-service.ts       Asset sync from update.starpeaceonline.com
+│   ├── texture-extractor.ts  CAB extraction → alpha bake → atlas generation
+│   ├── map-data-service.ts   Map INI/BMP parsing
+│   ├── chunk-renderer.ts     RGBA chunk compositing + worker pool + preview
+│   └── chunk-worker.ts       Worker thread rendering kernel
 ├── codecs/
-│   ├── texture-alpha-baker.ts  # BMP/PNG/WebP codecs (Sharp)
-│   ├── atlas-generator.ts     # Texture atlas packing
-│   └── cab-extractor.ts       # CAB archive extraction
+│   ├── texture-alpha-baker.ts  BMP/PNG/WebP codec wrappers (Sharp)
+│   ├── atlas-generator.ts     Texture atlas bin-packing
+│   └── cab-extractor.ts       CAB archive extraction (7zip-min)
 ├── upload/
-│   └── r2-uploader.ts    # Cloudflare R2 upload (S3-compatible)
+│   └── r2-uploader.ts        Cloudflare R2 upload (S3 SDK, 20 concurrent, retry)
 └── shared/
-    ├── types.ts           # Season, MapMetadata
-    ├── constants.ts       # Chunk size, zoom levels
-    ├── land-utils.ts      # Terrain tile decoding
-    └── error-utils.ts     # Safe error handling
+    ├── types.ts               Season enum, MapMetadata, MapTownInfo
+    ├── constants.ts           CHUNK_SIZE, zoom dimensions, UPDATE_SERVER
+    ├── land-utils.ts          LandId bit decoding (class/type/var)
+    └── error-utils.ts         Safe unknown error handling
 ```
 
 ## License
