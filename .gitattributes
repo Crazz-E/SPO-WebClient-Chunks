@@ -1,0 +1,5 @@
+# Enforce LF line endings everywhere
+* text=auto eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.md text eol=lf
